@@ -2,7 +2,9 @@ use crate::daemon::Daemon;
 use crate::pithos::anims::spring::Spring;
 use crate::pithos::commands::RenderMode;
 use crate::pithos::config::DaemonConfig;
-use crate::pithos::misc::get_viewport_dimensions;
+use crate::pithos::misc::{
+    get_effective_render_mode, get_scale_to_dimensions, get_viewport_dimensions,
+};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -144,6 +146,7 @@ pub struct OutputState {
     pub name: String,
     pub width: i32,
     pub height: i32,
+    pub scale: i32,
     pub done: bool,
     pub transform: wl_output::Transform,
     pub render_state: OutputRenderStateVariety,
@@ -156,6 +159,7 @@ impl Default for OutputState {
             name: String::default(),
             width: 0,
             height: 0,
+            scale: 1,
             done: false,
             transform: wl_output::Transform::Normal,
             render_state: OutputRenderStateVariety::None,
@@ -165,6 +169,17 @@ impl Default for OutputState {
 }
 
 impl OutputState {
+    // wl_output reports width/height in physical pixels (the Mode event), but
+    // layer-shell surface size / wp_viewport destination are surface-local units,
+    // i.e. physical pixels divided by the output's integer scale factor.
+    pub fn logical_width(&self) -> i32 {
+        self.width / self.scale.max(1)
+    }
+
+    pub fn logical_height(&self) -> i32 {
+        self.height / self.scale.max(1)
+    }
+
     pub fn reseat(
         &mut self,
         conn: &mut Connection<RenderThreadState>,
@@ -433,7 +448,11 @@ impl WallpaperRenderState {
 
         surface.attach(conn, Some(buf), 0, 0);
         surface.damage(conn, 0, 0, width.output_dim, height.output_dim);
-        viewport.set_destination(conn, output_state.width, output_state.height);
+        viewport.set_destination(
+            conn,
+            output_state.logical_width(),
+            output_state.logical_height(),
+        );
 
         viewport.set_source(
             conn,
@@ -492,7 +511,7 @@ impl WallpaperRenderState {
     pub fn scroll(
         &mut self,
         conn: &mut Connection<RenderThreadState>,
-        _scroll_x: f64,
+        scroll_x: f64,
         scroll_y: f64,
     ) {
         // scroll (x|y) track the % (0.0 => 100.0) of the center of the viewport along each dimension
@@ -503,6 +522,11 @@ impl WallpaperRenderState {
         match self.mode {
             RenderMode::Static => return,
             RenderMode::ScrollVertical => self.height.scroll(scroll_y, self.slowdown),
+            RenderMode::ScrollHorizontal => self.width.scroll(scroll_x, self.slowdown),
+            RenderMode::ScrollBoth => {
+                self.width.scroll(scroll_x, self.slowdown);
+                self.height.scroll(scroll_y, self.slowdown);
+            }
         };
 
         if !is_already_scrolling {
@@ -592,8 +616,11 @@ impl WallpaperRenderState {
         // Atomically swap to new buffer and update state
         verbose(pandora.clone(), "attaching new buffer");
         self.surface.attach(conn, Some(new_buffer), 0, 0);
-        self.viewport
-            .set_destination(conn, output_state.width, output_state.height);
+        self.viewport.set_destination(
+            conn,
+            output_state.logical_width(),
+            output_state.logical_height(),
+        );
         self.viewport.set_source(
             conn,
             viewport_x_start.into(),
@@ -767,6 +794,7 @@ pub fn initialize_wallpaper_outputs(
                 maybe_positions.copied(),
                 output_state.width,
                 output_state.height,
+                output_state.scale,
                 output_state.done,
             ));
         } else {
@@ -778,7 +806,7 @@ pub fn initialize_wallpaper_outputs(
     }
 
     // Now process each output, creating render states one by one
-    for (wl_output, output_name, image_path, mode, scroll_percents, width, height, done) in
+    for (wl_output, output_name, image_path, mode, scroll_percents, width, height, scale, done) in
         output_configs
     {
         // Create a temporary OutputState for the constructor
@@ -786,6 +814,7 @@ pub fn initialize_wallpaper_outputs(
             name: output_name.clone(),
             width,
             height,
+            scale,
             done,
             transform: wl_output::Transform::Normal,
             render_state: OutputRenderStateVariety::None,
@@ -825,38 +854,26 @@ fn image_to_file(
 ) -> (i32, i32, RenderMode) {
     let (img_width_orig, img_height_orig) = pandora.clone().load_image(path).unwrap();
 
-    // Check aspect ratios for ScrollVertical mode fallback
-    let effective_mode = match mode {
-        RenderMode::ScrollVertical => {
-            // e.g. portrait 1:3 image, 1/3
-            let image_aspect_ratio = img_width_orig as f64 / img_height_orig as f64;
-            // e.g. landscape 21:9 monitor, 2.133...
-            // when rotated, is 9:21, or ~0.42
-            let output_aspect_ratio = width as f64 / height as f64;
+    let effective_mode =
+        get_effective_render_mode(img_width_orig, img_height_orig, width, height, *mode);
 
-            // a 1:3 image will always be sufficient for this, while a 1:2 image would be insufficient on rotate
-            if image_aspect_ratio > output_aspect_ratio {
-                // Image is wider than output - fall back to Static mode
-                pandora.clone().log(
-                    "wallpaper",
-                    format!(
-                        "Falling back to Static mode: image {}x{} (aspect {:.2}) is wider than output {}x{} (aspect {:.2})",
-                        img_width_orig, img_height_orig, image_aspect_ratio,
-                        width, height, output_aspect_ratio
-                    )
-                );
-                RenderMode::Static
-            } else {
-                RenderMode::ScrollVertical
-            }
-        }
-        RenderMode::Static => RenderMode::Static,
-    };
+    if effective_mode != *mode {
+        pandora.clone().log(
+            "wallpaper",
+            format!(
+                "Adjusting render mode from {:?} to {:?} for image {}x{} on output {}x{}",
+                mode, effective_mode, img_width_orig, img_height_orig, width, height
+            ),
+        );
+    }
 
-    let scale_to = match effective_mode {
-        RenderMode::Static => (Some(width), Some(height)),
-        RenderMode::ScrollVertical => (Some(width), None),
-    };
+    let scale_to = get_scale_to_dimensions(
+        img_width_orig,
+        img_height_orig,
+        width,
+        height,
+        effective_mode,
+    );
 
     let (img_width, img_height) = pandora.clone().read_img_to_file(path, f, scale_to).unwrap();
 
@@ -956,7 +973,9 @@ fn wl_output_cb(ctx: EventCtx<RenderThreadState, WlOutput>) {
                 output_state.needs_reinit = true;
             }
         }
-        // wl_output::Event::Scale(scale) => output.scale = Some(scale), // maybe track this for lockscreen element scaling?
+        wl_output::Event::Scale(factor) => {
+            output_state.scale = factor;
+        }
         wl_output::Event::Done => {
             output_state.done = true;
             output.done = true;
